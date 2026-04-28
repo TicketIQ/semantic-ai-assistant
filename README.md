@@ -48,6 +48,7 @@ FastAPI (Python)
 Uvicorn server
 Database
 PostgreSQL
+SQLite
 pgvector extension (for embeddings)
 AI / ML
 OpenAI (Embeddings + Response generation)
