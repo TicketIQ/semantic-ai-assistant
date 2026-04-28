@@ -3,6 +3,7 @@ import { useState, useRef } from "react";
 export default function App() {
   const [text, setText] = useState("");
   const [response, setResponse] = useState("");
+
   const recognitionRef = useRef(null);
 
   const startVoice = () => {
@@ -10,37 +11,80 @@ export default function App() {
       window.SpeechRecognition || window.webkitSpeechRecognition;
 
     if (!SpeechRecognition) {
-      alert("Speech Recognition not supported in this browser");
+      alert("Speech API not supported in this browser");
       return;
     }
 
     const recognition = new SpeechRecognition();
+
+    // ✅ FIXED SETTINGS (important for no-speech issue)
     recognition.lang = "en-US";
-    recognition.continuous = false;
+    recognition.continuous = true;
+    recognition.interimResults = true;
+    recognition.maxAlternatives = 1;
 
-    recognition.onresult = async (event) => {
-      const transcript = event.results[0][0].transcript;
-      setText(transcript);
+    let finalText = "";
 
-      // call backend
-      const res = await fetch("http://127.0.0.1:8001/process", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ text: transcript }),
-      });
-
-      const data = await res.json();
-      setResponse(data.response);
+    recognition.onstart = () => {
+      console.log("🟢 Listening started...");
     };
 
-    recognition.onend = () => {
-      console.log("Voice stopped");
+    recognition.onresult = (event) => {
+      let interimText = "";
+
+      for (let i = event.resultIndex; i < event.results.length; i++) {
+        const transcript = event.results[i][0].transcript;
+
+        if (event.results[i].isFinal) {
+          finalText += transcript + " ";
+        } else {
+          interimText += transcript;
+        }
+      }
+
+      const fullText = finalText + interimText;
+
+      console.log("🎤 LIVE:", fullText);
+      setText(fullText);
     };
 
-    recognitionRef.current = recognition;
+    recognition.onerror = (event) => {
+      console.log("❌ Speech error:", event.error);
+    };
+
+    recognition.onend = async () => {
+      console.log("⛔ Speech stopped");
+
+      const cleaned = finalText.trim();
+
+      if (!cleaned) {
+        console.log("⚠️ No speech detected (ignored)");
+        return;
+      }
+
+      try {
+        const res = await fetch("http://127.0.0.1:8001/process", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({ text: cleaned }),
+        });
+
+        const data = await res.json();
+
+        console.log("📦 Backend response:", data);
+
+        setResponse(data.response);
+      } catch (err) {
+        console.error("❌ Backend error:", err);
+      }
+
+      finalText = "";
+    };
+
     recognition.start();
+    recognitionRef.current = recognition;
   };
 
   const stopVoice = () => {
@@ -54,33 +98,23 @@ export default function App() {
     <div style={{ textAlign: "center", marginTop: "100px" }}>
       <h1>🎤 Voice AI Assistant</h1>
 
-      <button
-        onClick={startVoice}
-        style={{
-          fontSize: "18px",
-          padding: "10px 20px",
-          marginRight: "10px",
-          cursor: "pointer",
-        }}
-      >
-        Start 🎤
-      </button>
+      <button onClick={startVoice}>Start 🎤</button>
 
-      <button
-        onClick={stopVoice}
-        style={{
-          fontSize: "18px",
-          padding: "10px 20px",
-          cursor: "pointer",
-          backgroundColor: "red",
-          color: "white",
-        }}
-      >
+      <button onClick={stopVoice} style={{ marginLeft: "10px" }}>
         Stop ⛔
       </button>
 
       <h3>🗣️ You said:</h3>
-      <p>{text}</p>
+
+      <input
+        value={text}
+        readOnly
+        style={{
+          width: "420px",
+          padding: "10px",
+          fontSize: "16px",
+        }}
+      />
 
       <h3>🤖 Response:</h3>
       <p>{response}</p>
