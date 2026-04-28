@@ -2,13 +2,13 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import sqlite3
-import anthropic
-import re
 import os
 
 app = FastAPI()
 
-# ── CORS (allow frontend to call backend) ──────────────────────────────────────
+# ───────────────────────────────
+# CORS
+# ───────────────────────────────
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -17,16 +17,25 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── Config ─────────────────────────────────────────────────────────────────────
-ANTHROPIC_API_KEY    = os.getenv("ANTHROPIC_API_KEY", "YOUR_API_KEY_HERE")
-SIMILARITY_THRESHOLD = 0.40   # 40% word overlap triggers a cache hit
-DB_PATH              = "qa_cache.db"
+# ───────────────────────────────
+# CONFIG
+# ───────────────────────────────
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 
-# ── Request model ──────────────────────────────────────────────────────────────
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(BASE_DIR, "qa_cache.db")
+
+print("📦 DATABASE PATH:", DB_PATH)
+
+# ───────────────────────────────
+# REQUEST MODEL
+# ───────────────────────────────
 class RequestData(BaseModel):
     text: str
 
-# ── Database setup ─────────────────────────────────────────────────────────────
+# ───────────────────────────────
+# DATABASE
+# ───────────────────────────────
 def get_db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -36,51 +45,23 @@ def init_db():
     with get_db() as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS qa_cache (
-                id         INTEGER  PRIMARY KEY AUTOINCREMENT,
-                question   TEXT     NOT NULL,
-                answer     TEXT     NOT NULL,
-                hit_count  INTEGER  DEFAULT 0,
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                question TEXT,
+                answer TEXT,
+                hit_count INTEGER DEFAULT 0,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         """)
         conn.commit()
 
-init_db()   # runs once when the server starts
+init_db()
 
-# ── Similarity helpers ─────────────────────────────────────────────────────────
-def tokenize(text: str) -> set:
-    """Lowercase, strip punctuation, return word-token set."""
-    return set(re.sub(r"[^a-z0-9\s]", "", text.lower()).split())
+# ───────────────────────────────
+# SAVE CACHE
+# ───────────────────────────────
+def save_cache(question, answer):
+    print("💾 SAVING TO DB:", question)
 
-def jaccard_similarity(a: str, b: str) -> float:
-    """Overlap between two questions as a 0-1 score."""
-    set_a, set_b = tokenize(a), tokenize(b)
-    if not set_a and not set_b:
-        return 1.0
-    union = set_a | set_b
-    return len(set_a & set_b) / len(union) if union else 0.0
-
-def find_best_match(question: str):
-    """
-    Scan the DB and return (row, score) if the best match
-    exceeds SIMILARITY_THRESHOLD, otherwise (None, 0).
-    """
-    with get_db() as conn:
-        rows = conn.execute(
-            "SELECT id, question, answer FROM qa_cache"
-        ).fetchall()
-
-    best_row, best_score = None, 0.0
-    for row in rows:
-        score = jaccard_similarity(question, row["question"])
-        if score > best_score:
-            best_score, best_row = score, row
-
-    if best_score >= SIMILARITY_THRESHOLD:
-        return best_row, best_score
-    return None, 0.0
-
-def save_to_db(question: str, answer: str):
     with get_db() as conn:
         conn.execute(
             "INSERT INTO qa_cache (question, answer) VALUES (?, ?)",
@@ -88,72 +69,138 @@ def save_to_db(question: str, answer: str):
         )
         conn.commit()
 
-def increment_hit(row_id: int):
+    print("✅ SAVED SUCCESSFULLY")
+
+# ───────────────────────────────
+# FIND CACHE
+# ───────────────────────────────
+def find_cache(question):
+    with get_db() as conn:
+        rows = conn.execute("SELECT * FROM qa_cache").fetchall()
+
+    question = question.lower()
+
+    for r in rows:
+        if question in r["question"].lower():
+            print("⚡ CACHE HIT:", r["question"])
+            return r
+
+    return None
+
+# ───────────────────────────────
+# UPDATE HIT COUNT
+# ───────────────────────────────
+def update_hit(id):
     with get_db() as conn:
         conn.execute(
             "UPDATE qa_cache SET hit_count = hit_count + 1 WHERE id = ?",
-            (row_id,),
+            (id,),
         )
         conn.commit()
 
-# ── Claude API call ────────────────────────────────────────────────────────────
-def ask_claude(question: str) -> str:
+# ───────────────────────────────
+# CLAUDE CALL (OPTIONAL)
+# ───────────────────────────────
+def ask_claude(text: str) -> str:
+    import anthropic
+
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-    message = client.messages.create(
-        model="claude-opus-4-5",
-        max_tokens=1024,
-        system=(
-            "You are a helpful voice assistant. "
-            "Answer questions clearly and concisely in 1-3 sentences."
-        ),
-        messages=[{"role": "user", "content": question}],
+
+    msg = client.messages.create(
+        model="claude-3-opus-20240229",
+        max_tokens=300,
+        messages=[{"role": "user", "content": text}],
     )
-    return message.content[0].text.strip()
 
-# ── Root test route ────────────────────────────────────────────────────────────
-@app.get("/")
-def home():
-    return {"message": "Voice AI Backend is running 🚀"}
+    return msg.content[0].text.strip()
 
-# ── Voice processing route ─────────────────────────────────────────────────────
+# ───────────────────────────────
+# SMART ENGINE (FIXED)
+# ───────────────────────────────
+def generate_response(text: str):
+
+    # 1️⃣ CACHE FIRST
+    cached = find_cache(text)
+    if cached:
+        update_hit(cached["id"])
+        return cached["answer"], "cache"
+
+    answer = None
+    source = None
+
+    # 2️⃣ CLAUDE (IF KEY EXISTS)
+    if ANTHROPIC_API_KEY:
+        try:
+            answer = ask_claude(text)
+            source = "claude"
+        except Exception as e:
+            print("❌ Claude error:", e)
+
+    # 3️⃣ FALLBACK (ALWAYS WORKS)
+    if answer is None:
+        t = text.lower()
+
+        if "hello" in t:
+            answer = "Hello 👋 (fallback mode)"
+        elif "how are you" in t:
+            answer = "I'm good 🤖 (fallback mode)"
+        else:
+            answer = f"You said: {text} (fallback mode)"
+
+        source = "fallback"
+
+    # 🔥 IMPORTANT: ALWAYS SAVE
+    save_cache(text, answer)
+
+    return answer, source
+
+# ───────────────────────────────
+# API ENDPOINT
+# ───────────────────────────────
 @app.post("/process")
 def process(req: RequestData):
-    question = req.text.strip()
 
-    # 1️⃣  Check the database first
-    match, score = find_best_match(question)
-    if match:
-        increment_hit(match["id"])
-        return {
-            "response":         match["answer"],
-            "source":           "cache",
-            "matched_question": match["question"],
-            "similarity":       round(score * 100, 1),  # e.g. 87.5
-        }
+    print("🎤 RECEIVED:", req.text)
 
-    # 2️⃣  Cache miss → ask Claude, then save for next time
-    answer = ask_claude(question)
-    save_to_db(question, answer)
+    response, source = generate_response(req.text)
+
+    print("🤖 RESPONSE:", response)
+    print("📌 SOURCE:", source)
 
     return {
-        "response": answer,
-        "source":   "claude",
+        "response": response,
+        "source": source
     }
 
-# ── Optional: view all saved Q&A pairs ────────────────────────────────────────
+# ───────────────────────────────
+# HEALTH CHECK
+# ───────────────────────────────
+@app.get("/")
+def home():
+    return {
+        "status": "Voice AI Backend Running 🚀",
+        "mode": "Claude ON" if ANTHROPIC_API_KEY else "Fallback Mode"
+    }
+
+# ───────────────────────────────
+# VIEW CACHE
+# ───────────────────────────────
 @app.get("/cache")
-def get_cache():
+def cache():
     with get_db() as conn:
-        rows = conn.execute(
-            "SELECT id, question, answer, hit_count, created_at "
-            "FROM qa_cache ORDER BY created_at DESC"
-        ).fetchall()
+        rows = conn.execute("SELECT * FROM qa_cache ORDER BY id DESC").fetchall()
+
+    print("📊 CACHE SIZE:", len(rows))
+
     return [dict(r) for r in rows]
 
-# ── Optional: delete one cache entry ──────────────────────────────────────────
-@app.delete("/cache/{entry_id}")
-def delete_entry(entry_id: int):
+# ───────────────────────────────
+# DELETE CACHE (OPTIONAL)
+# ───────────────────────────────
+@app.delete("/cache/{id}")
+def delete_cache(id: int):
     with get_db() as conn:
-        conn.execute("DELETE FROM qa_cache WHERE id = ?", (entry_id,))
+        conn.execute("DELETE FROM qa_cache WHERE id=?", (id,))
         conn.commit()
-    return {"deleted": entry_id}
+
+    return {"deleted": id}
